@@ -56,7 +56,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - run: docker build -f backend/Dockerfile -t interview-platform-api:scan .
+      - run: docker build --pull -f backend/Dockerfile -t interview-platform-api:scan .
+      - name: Test backend in its runtime image
+        run: docker run --rm -v "$PWD:/app:ro" --entrypoint python interview-platform-api:scan -m pytest -p no:cacheprovider
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: interview-platform-api:scan
@@ -69,11 +71,13 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - run: >-
-          docker build -f frontend/Dockerfile -t interview-platform-web:scan
+          docker build --pull -f frontend/Dockerfile -t interview-platform-web:scan
           --build-arg VITE_API_URL=https://api.example.com
           --build-arg VITE_SUPABASE_URL=https://example.supabase.co
           --build-arg VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_example
           frontend
+      - name: Validate nginx configuration
+        run: docker run --rm interview-platform-web:scan nginx -t
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: interview-platform-web:scan
