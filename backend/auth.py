@@ -5,6 +5,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from pydantic import EmailStr, TypeAdapter, ValidationError
 
 from backend.config import get_settings
 from backend.database import get_db
@@ -26,6 +27,8 @@ def current_principal(
 ) -> Principal:
     if credentials is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
+    if credentials.scheme.lower() != "bearer" or len(credentials.credentials) > 8192:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid access token")
     settings = get_settings()
     if not settings.supabase_url or not settings.supabase_publishable_key:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Supabase Auth is not configured")
@@ -39,15 +42,23 @@ def current_principal(
         )
     except httpx.RequestError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Authentication service unavailable") from exc
+    if response.status_code == 429 or response.status_code >= 500:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Authentication service unavailable")
     if response.status_code != status.HTTP_200_OK:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid access token")
     try:
         payload = response.json()
     except ValueError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid access token") from exc
-    if not isinstance(payload, dict) or not payload.get("id"):
+    if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not payload["id"] or payload.get("is_anonymous"):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid access token")
-    return Principal(user_id=payload["id"], email=payload.get("email"))
+    if not payload.get("email") or not payload.get("email_confirmed_at"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Confirm your email address before accessing interviews")
+    try:
+        email = str(TypeAdapter(EmailStr).validate_python(payload["email"]))
+    except ValidationError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid access token") from None
+    return Principal(user_id=payload["id"], email=email)
 
 
 @dataclass(frozen=True)

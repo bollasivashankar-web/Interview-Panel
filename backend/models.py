@@ -117,6 +117,7 @@ class Attempt(IdMixin, Base):
     deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     configuration_snapshot: Mapped[dict] = mapped_column(JSON)
+    evaluation: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
 
 
 class Answer(IdMixin, Base):

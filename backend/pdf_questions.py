@@ -67,7 +67,15 @@ def extract_pdf_questions(data: bytes) -> list[str]:
             raise PdfQuestionError("Password-protected PDFs are not supported")
         if len(reader.pages) > MAX_PDF_PAGES:
             raise PdfQuestionError(f"PDF must have no more than {MAX_PDF_PAGES} pages")
-        text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        pieces = []
+        characters = 0
+        for page in reader.pages:
+            piece = page.extract_text() or ""
+            characters += len(piece)
+            if characters > 500_000:
+                raise PdfQuestionError("PDF contains too much extracted text")
+            pieces.append(piece)
+        text = "\n\n".join(pieces)
     except PdfQuestionError:
         raise
     except (PdfReadError, OSError, ValueError) as exc:

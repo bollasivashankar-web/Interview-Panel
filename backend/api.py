@@ -1,9 +1,10 @@
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
+from starlette.concurrency import run_in_threadpool
 
 from backend.auth import CompanyContext, Principal, company_context, current_principal, require_roles
 from backend.config import get_settings
@@ -24,8 +25,12 @@ from backend.models import (
     ReattemptPermission,
     Role,
 )
-from backend.pdf_questions import MAX_PDF_BYTES, PdfQuestionError, extract_pdf_questions
+from backend.pdf_questions import MAX_PDF_BYTES, PdfQuestionError
+from backend.pdf_processing import PdfBusyError, process_pdf
 from backend.schemas import (
+    InterviewResultRead,
+    InterviewResultDetail,
+    ResultAnswerRead,
     AnswerCreate,
     AssignmentRead,
     AttemptRead,
@@ -50,12 +55,111 @@ from backend.schemas import (
     TemplateCreate,
     TemplateRead,
 )
-from backend.providers import OpenRouterQuestionProvider, ProviderError, get_email_provider
+from backend.providers import OpenRouterEvaluationProvider, OpenRouterQuestionProvider, ProviderError, get_email_provider
 from backend.services import accept_invitation, audit, aware, create_invitation_token, now, start_attempt
 
 
 router = APIRouter(prefix="/api/v1")
 manager = require_roles(Role.admin, Role.hr_manager)
+
+
+def result_query(company_id: str):
+    return (
+        select(Attempt, Candidate, InterviewTemplate, Job)
+        .join(Assignment, Attempt.assignment_id == Assignment.id)
+        .join(Candidate, Assignment.candidate_id == Candidate.id)
+        .join(InterviewTemplate, Assignment.template_id == InterviewTemplate.id)
+        .join(Job, InterviewTemplate.job_id == Job.id)
+        .where(Assignment.company_id == company_id)
+    )
+
+
+def result_summary(row, answered_count: int) -> InterviewResultRead:
+    attempt, candidate, template, job = row
+    effective_status = attempt.status.value
+    if attempt.status == AttemptStatus.active and aware(attempt.deadline_at) <= now():
+        effective_status = AttemptStatus.expired.value
+    return InterviewResultRead(
+        id=attempt.id, candidate_name=candidate.name, candidate_email=candidate.email,
+        job_title=job.title, interview_name=template.name, attempt_number=attempt.attempt_number,
+        status=effective_status, started_at=aware(attempt.started_at),
+        completed_at=aware(attempt.completed_at) if attempt.completed_at else None,
+        answered_count=answered_count,
+        question_count=len(attempt.configuration_snapshot.get("questions", [])),
+        average_score=attempt.evaluation.get("average_score") if attempt.evaluation else None,
+        evaluated_at=attempt.evaluation.get("evaluated_at") if attempt.evaluation else None,
+    )
+
+
+@router.get("/results", response_model=list[InterviewResultRead])
+def list_results(
+    context: CompanyContext = Depends(manager), db: Session = Depends(get_db),
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100),
+):
+    rows = db.execute(result_query(context.company_id).order_by(Attempt.started_at.desc(), Attempt.id).offset(offset).limit(limit)).all()
+    attempt_ids = [row[0].id for row in rows]
+    counts = dict(db.execute(select(Answer.attempt_id, func.count(Answer.id)).where(Answer.attempt_id.in_(attempt_ids)).group_by(Answer.attempt_id)).all()) if attempt_ids else {}
+    return [result_summary(row, counts.get(row[0].id, 0)) for row in rows]
+
+
+@router.get("/results/{attempt_id}", response_model=InterviewResultDetail)
+def get_result(attempt_id: str, context: CompanyContext = Depends(manager), db: Session = Depends(get_db)):
+    row = db.execute(result_query(context.company_id).where(Attempt.id == attempt_id)).first()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Interview result not found")
+    answers = {answer.question_id: answer for answer in db.scalars(select(Answer).where(Answer.attempt_id == attempt_id))}
+    questions = row[0].configuration_snapshot.get("questions", [])
+    scores = {item["question_id"]: item for item in (row[0].evaluation or {}).get("evaluations", [])}
+    return InterviewResultDetail(
+        **result_summary(row, len(answers)).model_dump(),
+        answers=[ResultAnswerRead(
+            question_id=question["id"], question=question["text"],
+            transcript=answers[question["id"]].transcript if question["id"] in answers else None,
+            submitted_at=aware(answers[question["id"]].submitted_at) if question["id"] in answers else None,
+            score=scores.get(question["id"], {}).get("score"),
+            feedback=scores.get(question["id"], {}).get("feedback"),
+        ) for question in questions],
+    )
+
+
+@router.post("/results/{attempt_id}/evaluate", response_model=InterviewResultDetail)
+def evaluate_result(attempt_id: str, context: CompanyContext = Depends(manager), db: Session = Depends(get_db)):
+    row = db.execute(result_query(context.company_id).where(Attempt.id == attempt_id)).first()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Interview result not found")
+    attempt = row[0]
+    if attempt.evaluation is not None:
+        return get_result(attempt_id, context, db)
+    if attempt.status != AttemptStatus.completed and not (
+        attempt.status in {AttemptStatus.active, AttemptStatus.expired} and aware(attempt.deadline_at) <= now()
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Evaluate after the interview is completed or expired")
+    questions = attempt.configuration_snapshot.get("questions", [])
+    if not questions:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This attempt has no questions to evaluate")
+    answers = {answer.question_id: answer.transcript for answer in db.scalars(select(Answer).where(Answer.attempt_id == attempt_id))}
+    rubrics = {question.id: question.rubric for question in db.scalars(select(Question).where(Question.template_id == row[2].id))}
+    inputs = [{"question_id": q["id"], "question": q["text"], "rubric": rubrics.get(q["id"], {}), "transcript": answers[q["id"]]}
+              for q in questions if answers.get(q["id"], "").strip()]
+    model = get_settings().openrouter_model
+    # Release the database connection before waiting on the external AI provider.
+    db.commit()
+    try:
+        batch = OpenRouterEvaluationProvider().evaluate(inputs) if inputs else None
+    except ProviderError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    scored = {item.question_id: item.model_dump() for item in batch.evaluations} if batch else {}
+    evaluations = [scored.get(q["id"], {"question_id": q["id"], "score": 0.0, "feedback": "No answer was submitted for this question."}) for q in questions]
+    evaluation = {"evaluations": evaluations,
+                  "average_score": round(sum(item["score"] for item in evaluations) / len(questions), 2),
+                  "evaluated_at": now().isoformat(), "model": model, "version": 1}
+    # Preserve the first saved evaluation if two requests finish concurrently.
+    saved = db.execute(update(Attempt).where(Attempt.id == attempt_id, Attempt.evaluation.is_(None)).values(evaluation=evaluation))
+    if saved.rowcount:
+        audit(db, context.company_id, context.principal.user_id, "attempt.evaluate", db.get(Attempt, attempt_id))
+    db.commit()
+    db.expire_all()
+    return get_result(attempt_id, context, db)
 
 
 @router.post("/companies", response_model=CompanyRead, status_code=201)
@@ -162,7 +266,7 @@ def tenant_template(db: Session, template_id: str, company_id: str, *, lock: boo
         .where(InterviewTemplate.id == template_id, InterviewTemplate.company_id == company_id)
     )
     if lock:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update().execution_options(populate_existing=True)
     template = db.scalar(statement)
     if template is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Interview not found")
@@ -211,7 +315,9 @@ async def extract_questions_from_pdf(
     data = await file.read(MAX_PDF_BYTES + 1)
     await file.close()
     try:
-        return PdfQuestionExtraction(questions=extract_pdf_questions(data))
+        return PdfQuestionExtraction(questions=await run_in_threadpool(process_pdf, data))
+    except PdfBusyError as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc), headers={"Retry-After": "5"}) from exc
     except PdfQuestionError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
@@ -281,6 +387,11 @@ def generate_questions(
     if template.published:
         raise HTTPException(status.HTTP_409_CONFLICT, "Published interviews are immutable")
     next_position = (db.scalar(select(func.max(Question.position)).where(Question.template_id == template.id)) or 0) + 1
+    if next_position + len(batch.questions) - 1 > 200:
+        raise HTTPException(status.HTTP_409_CONFLICT, "An interview can contain at most 200 questions")
+    existing_text = {question.text.strip().casefold() for question in template.questions}
+    if any(question.text.strip().casefold() in existing_text for question in batch.questions):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Questions were added concurrently; generate again")
     created = []
     for offset, generated in enumerate(batch.questions):
         rubric = {
@@ -324,9 +435,10 @@ def approve_question(
     )
     if question is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Question not found")
-    template = db.get(InterviewTemplate, question.template_id)
+    template = tenant_template(db, question.template_id, context.company_id, lock=True)
     if template.published:
         raise HTTPException(status.HTTP_409_CONFLICT, "Published interviews are immutable")
+    db.refresh(question)
     question.approved = True
     audit(db, context.company_id, context.principal.user_id, "question.approve", question)
     db.commit()
@@ -344,13 +456,13 @@ def update_question(
         select(Question)
         .join(InterviewTemplate)
         .where(Question.id == question_id, InterviewTemplate.company_id == context.company_id)
-        .with_for_update()
     )
     if question is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Question not found")
-    template = db.get(InterviewTemplate, question.template_id)
+    template = tenant_template(db, question.template_id, context.company_id, lock=True)
     if template.published:
         raise HTTPException(status.HTTP_409_CONFLICT, "Published interviews are immutable")
+    db.refresh(question)
     question.text = " ".join(body.text.split())
     question.time_limit_seconds = body.time_limit_seconds
     question.approved = False
@@ -372,9 +484,10 @@ def deselect_question(
     )
     if question is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Question not found")
-    template = db.get(InterviewTemplate, question.template_id)
+    template = tenant_template(db, question.template_id, context.company_id, lock=True)
     if template.published:
         raise HTTPException(status.HTTP_409_CONFLICT, "Published interviews are immutable")
+    db.refresh(question)
     question.approved = False
     audit(db, context.company_id, context.principal.user_id, "question.deselect", question)
     db.commit()
@@ -401,7 +514,7 @@ def set_all_question_approvals(
 
 @router.post("/interviews/{template_id}/publish", response_model=TemplateRead)
 def publish_template(template_id: str, context: CompanyContext = Depends(manager), db: Session = Depends(get_db)):
-    template = tenant_template(db, template_id, context.company_id)
+    template = tenant_template(db, template_id, context.company_id, lock=True)
     if not any(question.approved for question in template.questions):
         raise HTTPException(status.HTTP_409_CONFLICT, "Approve at least one question")
     template.published = True
@@ -550,6 +663,7 @@ def candidate_attempt(db: Session, attempt_id: str, user_id: str) -> Attempt:
         .join(Assignment)
         .join(Candidate)
         .where(Attempt.id == attempt_id, Candidate.auth_user_id == user_id)
+        .with_for_update(of=Attempt)
     )
     if attempt is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Attempt not found")

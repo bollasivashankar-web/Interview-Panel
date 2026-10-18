@@ -3,7 +3,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -80,9 +80,11 @@ def accept_invitation(db: Session, raw_token: str, user_id: str, email: str | No
             available_until=invitation.expires_at,
         )
         db.add(assignment)
-        db.flush()
-    audit(db, invitation.company_id, user_id, "invitation.accept", invitation)
+    elif aware(assignment.available_until) < aware(invitation.expires_at):
+        assignment.available_until = invitation.expires_at
     try:
+        db.flush()
+        audit(db, invitation.company_id, user_id, "invitation.accept", invitation)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -91,8 +93,8 @@ def accept_invitation(db: Session, raw_token: str, user_id: str, email: str | No
 
 
 def start_attempt(db: Session, assignment: Assignment, template: InterviewTemplate, actor_id: str) -> Attempt:
-    if aware(assignment.available_until) <= now():
-        raise HTTPException(status.HTTP_410_GONE, "Assignment expired")
+    # Serialize attempt numbering and permission consumption per assignment.
+    assignment = db.scalar(select(Assignment).where(Assignment.id == assignment.id).with_for_update())
     active = db.scalar(
         select(Attempt).where(
             Attempt.assignment_id == assignment.id,
@@ -104,6 +106,9 @@ def start_attempt(db: Session, assignment: Assignment, template: InterviewTempla
             return active
         active.status = AttemptStatus.expired
 
+    if aware(assignment.available_until) <= now():
+        raise HTTPException(status.HTTP_410_GONE, "Assignment expired")
+
     count = db.scalar(select(func.count(Attempt.id)).where(Attempt.assignment_id == assignment.id)) or 0
     permission = db.scalar(
         select(ReattemptPermission)
@@ -111,6 +116,7 @@ def start_attempt(db: Session, assignment: Assignment, template: InterviewTempla
             ReattemptPermission.assignment_id == assignment.id,
             ReattemptPermission.used_at.is_(None),
             ReattemptPermission.revoked_at.is_(None),
+            or_(ReattemptPermission.expires_at.is_(None), ReattemptPermission.expires_at > now()),
         )
         .order_by(ReattemptPermission.created_at)
     )
@@ -138,9 +144,9 @@ def start_attempt(db: Session, assignment: Assignment, template: InterviewTempla
         },
     )
     db.add(attempt)
-    db.flush()
-    audit(db, assignment.company_id, actor_id, "attempt.start", attempt)
     try:
+        db.flush()
+        audit(db, assignment.company_id, actor_id, "attempt.start", attempt)
         db.commit()
     except IntegrityError as exc:
         db.rollback()

@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.example
+node_modules
+dist
+*.pem
+*.key
+
+*.log
+**/*.log
+*.key
+*.pem
+*.p12
+*.pfx
+.agents

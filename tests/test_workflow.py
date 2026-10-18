@@ -2,7 +2,6 @@ import os
 from datetime import datetime, timedelta, timezone
 
 os.environ["APP_ENV"] = "test"
-os.environ["DATABASE_URL"] = "sqlite:///./test_interview_platform.db"
 os.environ["SUPABASE_JWT_SECRET"] = "test-secret-with-sufficient-length"
 os.environ["SUPABASE_JWT_AUDIENCE"] = "authenticated"
 os.environ["EMAIL_DELIVERY_MODE"] = "console"
@@ -258,7 +257,7 @@ def test_supabase_auth_server_validates_production_tokens(monkeypatch):
 
         @staticmethod
         def json():
-            return {"id": "supabase-user", "email": "user@example.com"}
+            return {"id": "supabase-user", "email": "user@example.com", "email_confirmed_at": "2026-01-01T00:00:00Z"}
 
     monkeypatch.setattr("backend.auth.auth_client.get", lambda *args, **kwargs: Response())
     try:
@@ -447,7 +446,7 @@ def test_pdf_questions_can_be_previewed_and_selected_for_import(client, monkeypa
         headers=headers,
     ).json()
     extracted = ["What is transaction isolation?", "How do you make an API idempotent?"]
-    monkeypatch.setattr("backend.api.extract_pdf_questions", lambda _: extracted)
+    monkeypatch.setattr("backend.api.process_pdf", lambda _: extracted)
 
     preview = client.post(
         f"/api/v1/interviews/{interview['id']}/questions/extract-pdf",

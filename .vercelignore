@@ -1,0 +1,19 @@
+# Upload application sources only; configure secrets in Vercel Environment Variables.
+.git
+.venv
+.env
+.env.*
+*.db
+*.sqlite*
+__pycache__
+.pytest_cache
+tests
+frontend
+
+*.log
+**/*.log
+*.key
+*.pem
+*.p12
+*.pfx
+.agents

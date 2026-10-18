@@ -182,6 +182,7 @@ class AssignmentRead(ORMModel):
 
 
 class AnswerCreate(StrictModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     question_id: str
     transcript: str = Field(min_length=1, max_length=50_000)
 
@@ -200,7 +201,51 @@ class CandidateAttemptRead(AttemptRead):
     answered_question_ids: list[str]
 
 
+class InterviewResultRead(StrictModel):
+    id: str
+    candidate_name: str | None
+    candidate_email: str
+    job_title: str
+    interview_name: str
+    attempt_number: int
+    status: str
+    started_at: datetime
+    completed_at: datetime | None
+    answered_count: int
+    question_count: int
+    average_score: float | None = None
+    evaluated_at: datetime | None = None
+
+
+class ResultAnswerRead(StrictModel):
+    question_id: str
+    question: str
+    transcript: str | None
+    submitted_at: datetime | None
+    score: float | None = None
+    feedback: str | None = None
+
+
+class InterviewResultDetail(InterviewResultRead):
+    answers: list[ResultAnswerRead]
+
+
+class AnswerEvaluation(StrictModel):
+    question_id: str
+    score: float = Field(ge=0, le=10, strict=True, allow_inf_nan=False)
+    feedback: str = Field(min_length=10, max_length=2000)
+
+
+class AnswerEvaluationBatch(StrictModel):
+    evaluations: list[AnswerEvaluation] = Field(min_length=1, max_length=200)
+
+
 class ReattemptCreate(StrictModel):
     reason: str = Field(min_length=10, max_length=2000)
     expires_at: datetime | None = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def valid_expiry(cls, value: datetime | None) -> datetime | None:
+        return validate_invitation_expiry(value) if value else None
 
