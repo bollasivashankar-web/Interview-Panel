@@ -30,3 +30,6 @@ target-version = "py312"
 
 [tool.vercel]
 entrypoint = "backend.main:app"
+
+[tool.vercel.scripts]
+build = "python -m alembic upgrade head"
